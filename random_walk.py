@@ -1,5 +1,5 @@
 import numpy as np
-from typing import Tuple, Optional, Union, List
+from typing import Tuple, Optional, Union, List, Dict, Callable
 
 
 class RandomWalkService:
@@ -218,6 +218,228 @@ class RandomWalkService:
             )
         return np.array(trajectories)
 
+    @staticmethod
+    def first_passage_time_1d(
+        trajectory: np.ndarray,
+        target: float,
+        direction: str = "any",
+        include_start: bool = False,
+        tol: float = 1e-9,
+    ) -> Optional[int]:
+        """
+        计算一维轨迹的首达时（首次到达目标位置的步数）
+
+        参数:
+            trajectory: 一维轨迹数组，形状 (n_steps + 1,)
+            target: 目标位置
+            direction: 到达方向
+                - "any": 任意方向（默认）
+                - "above": 从下方到达（位置从 < target 变为 >= target）
+                - "below": 从上方到达（位置从 > target 变为 <= target）
+            include_start: 若起始位置已满足条件，是否返回 0
+            tol: 数值比较容差
+
+        返回:
+            首次到达的步数（0-based），若未到达则返回 None
+        """
+        if trajectory.ndim != 1:
+            raise ValueError("trajectory 必须是一维数组")
+
+        if direction == "any":
+            reached = np.abs(trajectory - target) <= tol
+        elif direction == "above":
+            reached = trajectory >= target - tol
+        elif direction == "below":
+            reached = trajectory <= target + tol
+        else:
+            raise ValueError("direction 必须是 'any', 'above' 或 'below'")
+
+        start_idx = 0 if include_start else 1
+        idx = np.where(reached[start_idx:])[0]
+        if len(idx) == 0:
+            return None
+        return int(idx[0] + start_idx)
+
+    @staticmethod
+    def first_passage_time_2d(
+        trajectory: np.ndarray,
+        target: Union[Tuple[float, float], Tuple[float, float, float, float], Callable],
+        tol: float = 1e-9,
+        include_start: bool = False,
+    ) -> Optional[int]:
+        """
+        计算二维轨迹的首达时
+
+        参数:
+            trajectory: 二维轨迹数组，形状 (n_steps + 1, 2)
+            target: 目标，支持三种形式：
+                - (x, y): 目标点（精确到达，考虑容差 tol）
+                - (x_min, x_max, y_min, y_max): 目标矩形区域
+                - callable(x, y) -> bool: 自定义判定函数
+            tol: 目标点判定的数值容差
+            include_start: 若起始位置已满足条件，是否返回 0
+
+        返回:
+            首次到达的步数（0-based），若未到达则返回 None
+        """
+        if trajectory.ndim != 2 or trajectory.shape[1] != 2:
+            raise ValueError("trajectory 必须是形状为 (N, 2) 的二维数组")
+
+        xs = trajectory[:, 0]
+        ys = trajectory[:, 1]
+
+        if callable(target):
+            reached = np.array([bool(target(x, y)) for x, y in zip(xs, ys)])
+        elif len(target) == 2:
+            tx, ty = target
+            reached = (np.abs(xs - tx) <= tol) & (np.abs(ys - ty) <= tol)
+        elif len(target) == 4:
+            x_min, x_max, y_min, y_max = target
+            reached = (xs >= x_min - tol) & (xs <= x_max + tol) & \
+                      (ys >= y_min - tol) & (ys <= y_max + tol)
+        else:
+            raise ValueError("target 必须是二元组、四元组或可调用对象")
+
+        start_idx = 0 if include_start else 1
+        idx = np.where(reached[start_idx:])[0]
+        if len(idx) == 0:
+            return None
+        return int(idx[0] + start_idx)
+
+    def analyze_first_passage_1d(
+        self,
+        n_walkers: int,
+        target: float,
+        max_steps: int = 10000,
+        start: float = 0.0,
+        step_size: float = 1.0,
+        p: float = 0.5,
+        direction: str = "any",
+        include_start: bool = False,
+    ) -> Dict:
+        """
+        批量一维首达时统计分析
+
+        参数:
+            n_walkers: 游走者数量
+            target: 目标位置
+            max_steps: 最大模拟步数
+            start: 起始位置
+            step_size: 每步步长
+            p: 向右走的概率
+            direction: 到达方向 ("any", "above", "below")
+            include_start: 起始位置是否计为已到达
+
+        返回:
+            包含统计信息的字典:
+                - "fpt_list": 所有游走者的首达时列表（未到达者为 None）
+                - "reached_count": 成功到达的游走者数
+                - "reached_ratio": 到达比例
+                - "mean": 到达者的平均首达时
+                - "std": 到达者的首达时标准差
+                - "min": 最短首达时
+                - "max": 最长首达时
+                - "median": 首达时中位数
+        """
+        trajectories = self.simulate_batch_1d(
+            n_walkers, max_steps, start, step_size, p
+        )
+
+        fpt_list: List[Optional[int]] = []
+        for traj in trajectories:
+            fpt = self.first_passage_time_1d(
+                traj, target, direction, include_start
+            )
+            fpt_list.append(fpt)
+
+        reached = [t for t in fpt_list if t is not None]
+        reached_arr = np.array(reached, dtype=float)
+
+        result: Dict = {
+            "fpt_list": fpt_list,
+            "reached_count": len(reached),
+            "reached_ratio": len(reached) / n_walkers,
+        }
+        if len(reached) > 0:
+            result.update({
+                "mean": float(np.mean(reached_arr)),
+                "std": float(np.std(reached_arr)),
+                "min": int(np.min(reached_arr)),
+                "max": int(np.max(reached_arr)),
+                "median": float(np.median(reached_arr)),
+            })
+        else:
+            result.update({
+                "mean": None, "std": None,
+                "min": None, "max": None, "median": None,
+            })
+        return result
+
+    def analyze_first_passage_2d(
+        self,
+        n_walkers: int,
+        target: Union[Tuple[float, float], Tuple[float, float, float, float], Callable],
+        max_steps: int = 10000,
+        start: Tuple[float, float] = (0.0, 0.0),
+        step_size: float = 1.0,
+        mode: str = "lattice",
+        bounds: Optional[Tuple[float, float, float, float]] = None,
+        boundary_type: str = "none",
+        tol: float = 1e-9,
+        include_start: bool = False,
+    ) -> Dict:
+        """
+        批量二维首达时统计分析
+
+        参数:
+            n_walkers: 游走者数量
+            target: 目标（目标点/目标区域/自定义函数）
+            max_steps: 最大模拟步数
+            start: 起始坐标
+            step_size: 每步步长
+            mode: 游走模式 "lattice" 或 "continuous"
+            bounds: 边界范围
+            boundary_type: 边界处理类型
+            tol: 目标点判定容差
+            include_start: 起始位置是否计为已到达
+
+        返回:
+            与 analyze_first_passage_1d 相同结构的统计字典
+        """
+        trajectories = self.simulate_batch_2d(
+            n_walkers, max_steps, start, step_size, mode, bounds, boundary_type
+        )
+
+        fpt_list: List[Optional[int]] = []
+        for traj in trajectories:
+            fpt = self.first_passage_time_2d(
+                traj, target, tol, include_start
+            )
+            fpt_list.append(fpt)
+
+        reached = [t for t in fpt_list if t is not None]
+        reached_arr = np.array(reached, dtype=float)
+
+        result: Dict = {
+            "fpt_list": fpt_list,
+            "reached_count": len(reached),
+            "reached_ratio": len(reached) / n_walkers,
+        }
+        if len(reached) > 0:
+            result.update({
+                "mean": float(np.mean(reached_arr)),
+                "std": float(np.std(reached_arr)),
+                "min": int(np.min(reached_arr)),
+                "max": int(np.max(reached_arr)),
+                "median": float(np.median(reached_arr)),
+            })
+        else:
+            result.update({
+                "mean": None, "std": None,
+                "min": None, "max": None, "median": None,
+            })
+        return result
+
 
 def main():
     service = RandomWalkService(seed=42)
@@ -279,6 +501,76 @@ def main():
     )
     print("\n=== 批量二维反射边界随机游走 (2 个游走者, 3 步) ===")
     print(batch_2d)
+
+    print("\n" + "=" * 60)
+    print("首达时分析示例")
+    print("=" * 60)
+
+    traj_1d_long = service.simulate_1d(n_steps=500, start=0.0, step_size=1.0, p=0.5)
+    fpt_1d = RandomWalkService.first_passage_time_1d(
+        traj_1d_long, target=5.0, direction="above"
+    )
+    print(f"\n=== 一维首达时 (首次到达 x=5) ===")
+    print(f"  首达时: {fpt_1d} 步")
+    if fpt_1d is not None:
+        print(f"  轨迹第 {fpt_1d} 步位置: {traj_1d_long[fpt_1d]:.1f}")
+    else:
+        print("  (500 步内未到达)")
+
+    traj_2d_long = service.simulate_2d(
+        n_steps=1000, start=(0, 0), step_size=1.0, mode="lattice"
+    )
+    target_region = (3.0, 5.0, 3.0, 5.0)
+    fpt_2d_region = RandomWalkService.first_passage_time_2d(
+        traj_2d_long, target=target_region
+    )
+    print(f"\n=== 二维首达时 (首次进入矩形区域 x∈[3,5], y∈[3,5]) ===")
+    print(f"  首达时: {fpt_2d_region} 步")
+    if fpt_2d_region is not None:
+        pos = traj_2d_long[fpt_2d_region]
+        print(f"  轨迹第 {fpt_2d_region} 步位置: ({pos[0]:.1f}, {pos[1]:.1f})")
+    else:
+        print("  (1000 步内未到达)")
+
+    def inside_circle(x, y):
+        return (x - 3.0) ** 2 + (y - 3.0) ** 2 <= 2.0 ** 2
+
+    fpt_2d_circle = RandomWalkService.first_passage_time_2d(
+        traj_2d_long, target=inside_circle
+    )
+    print(f"\n=== 二维首达时 (首次进入圆心 (3,3) 半径 2 的圆) ===")
+    print(f"  首达时: {fpt_2d_circle} 步")
+    if fpt_2d_circle is not None:
+        pos = traj_2d_long[fpt_2d_circle]
+        dist = np.sqrt((pos[0] - 3) ** 2 + (pos[1] - 3) ** 2)
+        print(f"  轨迹第 {fpt_2d_circle} 步位置: ({pos[0]:.1f}, {pos[1]:.1f}), 距圆心: {dist:.2f}")
+    else:
+        print("  (1000 步内未到达)")
+
+    print("\n=== 一维批量首达时统计 (200 个游走者, 目标 x=5) ===")
+    stats_1d = service.analyze_first_passage_1d(
+        n_walkers=200, target=5.0, max_steps=500, p=0.5, direction="above"
+    )
+    print(f"  到达数/总数: {stats_1d['reached_count']}/{200}")
+    print(f"  到达比例: {stats_1d['reached_ratio']:.2%}")
+    if stats_1d["mean"] is not None:
+        print(f"  平均首达时: {stats_1d['mean']:.1f} ± {stats_1d['std']:.1f} 步")
+        print(f"  最短/最长: {stats_1d['min']} / {stats_1d['max']} 步")
+        print(f"  中位数: {stats_1d['median']:.1f} 步")
+
+    print("\n=== 二维批量首达时统计 (200 个游走者, 目标区域 x∈[3,5], y∈[3,5]) ===")
+    stats_2d = service.analyze_first_passage_2d(
+        n_walkers=200,
+        target=(3.0, 5.0, 3.0, 5.0),
+        max_steps=1000,
+        mode="lattice",
+    )
+    print(f"  到达数/总数: {stats_2d['reached_count']}/{200}")
+    print(f"  到达比例: {stats_2d['reached_ratio']:.2%}")
+    if stats_2d["mean"] is not None:
+        print(f"  平均首达时: {stats_2d['mean']:.1f} ± {stats_2d['std']:.1f} 步")
+        print(f"  最短/最长: {stats_2d['min']} / {stats_2d['max']} 步")
+        print(f"  中位数: {stats_2d['median']:.1f} 步")
 
 
 if __name__ == "__main__":
